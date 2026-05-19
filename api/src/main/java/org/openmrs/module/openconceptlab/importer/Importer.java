@@ -318,10 +318,6 @@ public class Importer implements Runnable {
 
 		token = advanceToListOf("concepts", "mappings", parser);
 
-		if (token == JsonToken.END_OBJECT || token == null) {
-			return;
-		}
-
 		// Look up subscription once for the entire import
 		Subscription subscription = importService.getSubscription();
 
@@ -360,47 +356,50 @@ public class Importer implements Runnable {
 		}
 
 		List<Item> items = new ArrayList<>(BATCH_SIZE);
-		while (parser.nextToken() != JsonToken.END_ARRAY) {
-			OclConcept oclConcept = parser.readValueAs(OclConcept.class);
-			oclConcept.setVersionUrl(prependBaseUrl(baseUrl, oclConcept.getVersionUrl()));
-			oclConcept.setUrl(prependBaseUrl(baseUrl, oclConcept.getUrl()));
 
-			Item item;
-			try {
-				item = saver.saveConcept(cacheService, anImport, oclConcept, validationType);
-				cacheService.cacheItem(item);
-				log.debug("Imported concept {}", oclConcept);
-			} catch (Throwable e) {
-				log.error("Failed to import concept {}", oclConcept, e);
-				Context.clearSession();
-				cacheService.clearCache();
+		if (token == JsonToken.START_ARRAY) {
+			while (parser.nextToken() != JsonToken.END_ARRAY) {
+				OclConcept oclConcept = parser.readValueAs(OclConcept.class);
+				oclConcept.setVersionUrl(prependBaseUrl(baseUrl, oclConcept.getVersionUrl()));
+				oclConcept.setUrl(prependBaseUrl(baseUrl, oclConcept.getUrl()));
 
-				item = new Item(anImport, oclConcept, ItemState.ERROR);
-				item.setErrorMessage(getUserFriendlyErrorMessage(e));
+				Item item;
+				try {
+					item = saver.saveConcept(cacheService, anImport, oclConcept, validationType);
+					cacheService.cacheItem(item);
+					log.debug("Imported concept {}", oclConcept);
+				} catch (Throwable e) {
+					log.error("Failed to import concept {}", oclConcept, e);
+					Context.clearSession();
+					cacheService.clearCache();
+
+					item = new Item(anImport, oclConcept, ItemState.ERROR);
+					item.setErrorMessage(getUserFriendlyErrorMessage(e));
+				}
+				items.add(item);
+
+				if (items.size() >= BATCH_SIZE) {
+					importService.saveItems(items);
+					items = new ArrayList<>(BATCH_SIZE);
+					// Flush and clear session to prevent memory buildup, then clear cache since entities are detached
+					importService.flushAndClearSession();
+					cacheService.clearCache();
+				}
 			}
-			items.add(item);
 
-			if (items.size() >= BATCH_SIZE) {
+			if (!items.isEmpty()) {
 				importService.saveItems(items);
 				items = new ArrayList<>(BATCH_SIZE);
-				// Flush and clear session to prevent memory buildup, then clear cache since entities are detached
-				importService.flushAndClearSession();
-				cacheService.clearCache();
 			}
-		}
 
-		if (!items.isEmpty()) {
-			importService.saveItems(items);
-			items = new ArrayList<>(BATCH_SIZE);
+			// Flush and clear before processing mappings to start fresh
+			importService.flushAndClearSession();
+			cacheService.clearCache();
 		}
-
-		// Flush and clear before processing mappings to start fresh
-		importService.flushAndClearSession();
-		cacheService.clearCache();
 
 		token = advanceToListOf("mappings", null, parser);
 
-		if (token == JsonToken.END_OBJECT) {
+		if (token != JsonToken.START_ARRAY) {
 			return;
 		}
 
@@ -465,33 +464,38 @@ public class Importer implements Runnable {
 		if (token == null) {
 			token = parser.nextToken();
 		}
+		// Caller ensures we start at the outer START_OBJECT; advance past it.
+		if (token == JsonToken.START_OBJECT) {
+			token = parser.nextToken();
+		}
 
-		do {
-			if (token == JsonToken.START_OBJECT) {
-				String text = parser.getText();
-				while ((token = parser.nextToken()) != JsonToken.END_OBJECT) {
-					if (token == null) {
-						throw new IOException("Missing end of object: " + text);
-					}
-				}
-			} else if (parser.getText().equals(field)) {
+		while (token != null && token != JsonToken.END_OBJECT) {
+			if (token != JsonToken.FIELD_NAME) {
+				// Defensive: unexpected token inside an object (e.g. END_ARRAY from a prior array consumption).
+				// Skip and continue scanning for the target field.
+				parser.skipChildren();
+				token = parser.nextToken();
+				continue;
+			}
+
+			String name = parser.getCurrentName();
+			if (field.equals(name)) {
 				token = parser.nextToken();
 				if (token != JsonToken.START_ARRAY) {
 					throw new ImportException(field + " must be a list");
 				}
 				return token;
-			} else if (token == JsonToken.START_ARRAY) {
-				String text = parser.getText();
-				while ((token = parser.nextToken()) != JsonToken.END_ARRAY) {
-					if (token == null) {
-						throw new IOException("Missing end of array: " + text);
-					}
-				}
-			} else if (stopAtField != null && parser.getText().equals(stopAtField)) {
+			}
+			if (stopAtField != null && stopAtField.equals(name)) {
 				return token;
 			}
-		} while ((token = parser.nextToken()) != null);
 
+			// Skip this field's value (scalar, array, or nested object).
+			parser.nextToken();
+			parser.skipChildren();
+			token = parser.nextToken();
+		}
+		log.info("Field '{}' not found in JSON object (stopAtField={})", field, stopAtField);
 		return null;
 	}
 
